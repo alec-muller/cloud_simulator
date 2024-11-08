@@ -1,0 +1,182 @@
+version: '3.8'
+
+# This part is used to define some config to airflow scheduler and webserver services.
+x-airflow-common: &airflow-common
+  build: ./airflow
+  environment:
+    &airflow-common-env
+    AIRFLOW_HOME: /opt/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+    AIRFLOW__CORE__EXPOSE_CONFIG: 'true'
+    AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__SECURE_MODE: 'true'
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+    AIRFLOW__DATABASE__LOAD_DEFAULT_CONNECTIONS: 'false'
+    AIRFLOW_VAR_MINIO_ACCESS_KEY: root
+    AIRFLOW_VAR_MINIO_SECRET_KEY: 12345678
+    AIRFLOW_CONN_POSTGRES_DEFAULT: '{"conn_type": "postgres", "host": "postgres", "login": "root", "password": "1234", "schema": "alec_db", "port": 5432}'
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-service:7077", "extra": {"deploy-mode": "cluster"}}'
+    AIRFLOW_CONN_MINIO_DEFAULT: '{"conn_type": "minio", "login": "root", "password": "12345678", "host": "minio", "port": 9000}'
+    AIRFLOW_CONN_AWS_DEFAULT: '{"conn_type": "aws", "login": "root", "password": "12345678", "extra": {"endpoint_url": "http://minio:9000", "region_name": "us-east-1", "aws_access_key_id": "root", "aws_secret_access_key": "12345678"}}'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    AIRFLOW__WEBSERVER__SHOW_TRIGGER_FORM_IF_NO_PARAMS: 'true'
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/includes:/opt/airflow/includes
+    - ./airflow/airflow.cfg:/opt/airflow/airflow.cfg
+    - ./airflow:/opt/airflow
+  user: "${AIRFLOW_UID:-50000}:${AIRFLOW_GID:-50000}"
+
+services:
+  minio:
+    build: ./minio
+    container_name: alec
+    environment:
+      MINIO_ROOT_USER: root
+      MINIO_ROOT_PASSWORD: 12345678
+    env_file:
+      - ./minio/config/minio.env
+    ports:
+      - "127.0.0.1:9000:9000"  # Para a API
+      - "9001:9001" # Para a WebUI
+    volumes:
+      - minio_data:/data
+    networks:
+      - default
+    command: server --address 0.0.0.0:9000 --console-address ":9001" /data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  createbuckets:
+    image: minio/mc:latest
+    environment:
+      MC_HOST_minio: http://root:12345678@minio:9000
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        until mc ls minio > /dev/null 2>&1; do
+          sleep 0.5
+        done
+
+        mc mb minio/alec
+        mc anonymous set public minio/alec
+        mc mb minio/alec/landing
+        mc mb minio/alec/bronze
+        mc mb minio/alec/silver
+        mc mb minio/alec/gold
+
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - 8080:8080
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      - airflow-init
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username ${_AIRFLOW_WWW_USER_USERNAME:-airflow} \
+          --firstname ${_AIRFLOW_FIRSTNAME:-''} \
+          --lastname ${_AIRFLOW_LASTNAME:-''} \
+          --role Admin \
+          --email ${_AIRFLOW_EMAIL:-airflow@example.com} \
+          --password ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+
+  postgres:
+    build: ./postgres
+    container_name: alec
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: 1234
+      POSTGRES_DB: alec_db
+    ports:
+      - "5432:5432"
+    restart: always
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - default
+
+  spark-master:
+    build: ./spark
+    container_name: spark-master
+    hostname: spark-service
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+
+  spark-worker:
+    build: ./spark
+    container_name: spark-worker
+    hostname: spark-worker-1
+    depends_on:
+      - spark-master
+    ports:
+      - "8082:8081"  # Worker Web UI
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-service:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=1G
+
+volumes:
+  minio_data:
+  postgres_data:
+
+networks:
+  default:
+    driver: bridge

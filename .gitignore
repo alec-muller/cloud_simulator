@@ -1,0 +1,8 @@
+airflow/logs/
+minio/data/*
+airflow/*.db
+airflow/*spark
+airflow/derby*
+airflow-webserver.pid
+airflow/dags/__pycache__
+airflow/metastore_db
